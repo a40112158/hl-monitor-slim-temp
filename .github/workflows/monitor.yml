@@ -1,0 +1,457 @@
+name: Hyperliquid Wallet Monitor FINAL
+
+on:
+  workflow_dispatch:
+    inputs:
+      send_start_test:
+        description: "Send a Telegram startup test message"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hl-wallet-monitor-final
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Restore state from data branch
+        continue-on-error: true
+        run: |
+          git fetch origin data --depth 1 || {
+            echo "No data branch yet; starting empty."
+            exit 0
+          }
+          git checkout origin/data -- hl_monitor.db.gz coin_thresholds_auto.json 2>/dev/null || true
+          git checkout origin/data -- reports 2>/dev/null || true
+          git reset HEAD -- . >/dev/null 2>&1 || true
+
+      - name: Restore compressed database
+        run: |
+          if [ -f hl_monitor.db.gz ]; then
+            echo "Restoring hl_monitor.db from data-branch hl_monitor.db.gz..."
+            gzip -dc hl_monitor.db.gz > hl_monitor.db
+            ls -lh hl_monitor.db hl_monitor.db.gz || true
+          else
+            echo "No hl_monitor.db.gz found. Starting with fresh local SQLite database."
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          if [ -f requirements-ai.txt ]; then
+            python -m pip install -r requirements-ai.txt || echo "::warning::Gemini SDK install failed; core monitor will continue."
+          fi
+
+      - name: Validate Python sources
+        run: |
+          python -m py_compile hl_monitor_final.py scripts/compact_sqlite_hardcap.py
+          for file in analysis_layer.py optimization_store.py gemini_optimizer.py gemini_scan_analysis.py; do
+            if [ -f "$file" ]; then python -m py_compile "$file"; fi
+          done
+
+      - name: Run regression tests
+        env:
+          PYTHONUTF8: "1"
+        run: python -m unittest discover -s tests -v
+
+      - name: Configure Google Cloud credentials for Vertex AI
+        env:
+          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
+          GOOGLE_CLOUD_PROJECT_VALUE: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+          GOOGLE_CLOUD_LOCATION_VALUE: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+        run: |
+          if [ -n "$GCP_SA_KEY_JSON" ]; then
+            echo "$GCP_SA_KEY_JSON" > "$RUNNER_TEMP/gcp-sa-key.json"
+            echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-sa-key.json" >> "$GITHUB_ENV"
+            echo "Vertex AI service account JSON configured."
+          else
+            echo "GCP_SA_KEY_JSON not configured. Vertex AI fallback will be skipped unless ADC already exists."
+          fi
+          if [ -n "$GOOGLE_CLOUD_PROJECT_VALUE" ]; then
+            echo "GOOGLE_CLOUD_PROJECT=$GOOGLE_CLOUD_PROJECT_VALUE" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$GOOGLE_CLOUD_LOCATION_VALUE" ]; then
+            echo "GOOGLE_CLOUD_LOCATION=$GOOGLE_CLOUD_LOCATION_VALUE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Test Telegram on manual run
+        if: ${{ inputs.send_start_test == true }}
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "TG_BOT_TOKEN or TG_CHAT_ID is empty. Skip TG test."
+          else
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="GitHub Actions TG test: Hyperliquid monitor is starting."
+          fi
+
+      - name: Run Hyperliquid monitor
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+          # 稳定版：使用本地 SQLite，结束后压缩成 hl_monitor.db.gz 提交，避免 GitHub 100MB 限制。
+          DB_BACKEND: "sqlite"
+          HL_DB_FILE: "hl_monitor.db"
+          AUTO_THRESHOLD_ENABLED: "1"
+          AUTO_THRESHOLD_FILE: "coin_thresholds_auto.json"
+
+          # 0 = 只有强信号或每日复盘才推送；1 = 每次运行都推送
+          PUSH_EVERY_RUN: "0"
+
+          # 报告显示和每日复盘按北京时间。DAILY_PUSH_HOUR_CN=8 表示北京时间早上 8 点后当天首轮成功报告推送。
+          DISPLAY_TZ_NAME: "北京时间"
+          DISPLAY_TZ_OFFSET_HOURS: "8"
+          DAILY_PUSH_HOUR_CN: "8"
+          DAILY_PUSH_HOUR_UTC: "0"
+
+          HL_RPM: "300"
+          HL_CONCURRENCY: "10"
+          MIN_OK_RATE: "0.85"
+          MIN_WALLET_COUNT: "100"
+          TOP_N: "15"
+
+          # 低杠杆长期单过滤
+          LONG_TERM_MODE: "1"
+          LONG_TERM_MIN_SCORE: "7"
+          LONG_TERM_MIN_STREAK: "2"
+          LONG_TERM_RISK_PCT: "2"
+          LONG_TERM_MAX_LEVERAGE: "3"
+
+          # 每日归档：reports/daily/YYYY-MM-DD，每天保留一份长期复盘快照
+          DAILY_ARCHIVE: "1"
+          DAILY_ARCHIVE_KEEP_DAYS: "30"
+
+          # 钱包质量系统：最近30天滚动分类并导出全部钱包
+          WALLET_QUALITY_MODE: "1"
+          WALLET_QUALITY_WINDOW_DAYS: "30"
+          WALLET_QUALITY_MIN_SAMPLES: "10"
+          WALLET_QUALITY_EXPORT: "1"
+
+          # 合约杠杆质量过滤：适配低杠杆长期单
+          LEVERAGE_QUALITY_MODE: "1"
+          LEVERAGE_LOW_MAX: "3"
+          LEVERAGE_MID_MAX: "5"
+          LEVERAGE_HIGH_MIN: "10"
+          LIQ_SAFE_DISTANCE_PCT: "40"
+          LIQ_DANGER_DISTANCE_PCT: "10"
+
+          # 仓位生命周期收益：只按开/加/减/平统计，不使用账户权益 ROI
+          POSITION_TRADE_MODE: "1"
+          POSITION_PERF_WINDOW_DAYS: "30"
+          POSITION_MIN_QTY_CHANGE_RATIO: "0.05"
+          POSITION_MIN_QTY_CHANGE_USD: "1000"
+
+          # 现货增减明细：资金流 Lite 中显示本轮增持/减持了哪些现货币
+          SPOT_DETAIL_MIN_USD: "1000"
+          # 异常现货只保留原始记录，不进入资金流/评分/AI。
+          SPOT_MAX_TRUSTED_VALUE_USD: "250000000"
+          SPOT_MIN_DYNAMIC_CAP_USD: "5000000"
+          SPOT_VOLUME_CAP_MULTIPLIER: "20"
+          SPOT_NONCANONICAL_CAP_MULTIPLIER: "8"
+          SPOT_MAX_PRICE_CHANGE_PCT: "100"
+          SPOT_MAX_ANOMALY_RATIO: "0.10"
+          SPOT_MIN_TRUSTED_ROWS: "10"
+          SIGNAL_EVENT_COOLDOWN_HOURS: "12"
+          LONGTERM_EVENT_COOLDOWN_HOURS: "24"
+          SIGNAL_MODEL_VERSION: "2"
+          SIGNAL_EVENT_KEEP_DAYS: "90"
+          BACKTEST_ROUNDTRIP_COST_PCT: "0.12"
+          DAILY_DETAIL_KEEP_DAYS: "7"
+          WALLET_QUALITY_DECAY_HALF_LIFE_DAYS: "14"
+          EVIDENCE_ENRICH_MODE: "1"
+          EVIDENCE_TOP_WALLETS: "12"
+          EVIDENCE_CONCURRENCY: "4"
+          WALLET_CLUSTER_MODE: "1"
+          WALLET_CLUSTER_MIN_COOCCURRENCE: "3"
+          WALLET_CLUSTER_MIN_SIMILARITY: "0.70"
+          HEALTH_DB_GZ_WARN_MB: "75"
+
+          # 报告底部复盘窗口：过去30天信号复盘 + 过去30天钱包主动资金流
+          REPORT_REVIEW_WINDOW_DAYS: "30"
+
+          # 滚动建仓信号：短线看上一轮，中长期看 2h/6h/24h/72h/15d/30d
+          ROLLING_FLOW_MODE: "1"
+          # 滚动杠杆质量：长期单同时看低/中杠杆占比、高风险杠杆占比、平均杠杆和强平距离
+          ROLLING_LEVERAGE_MODE: "1"
+          EXPECTED_INTERVAL_MINUTES: "30"
+          MAX_SHORT_SIGNAL_GAP_MINUTES: "90"
+          ROLLING_FLOW_WINDOWS_HOURS: "2,6,24,72,360,720"
+          # 滚动评分修正：嵌套窗口去重 + 持续性/广度/现货-only/集中度过滤
+          ROLLING_DEDUP_SCORE_MODE: "1"
+          ROLLING_MIN_WALLETS_MID: "2"
+          ROLLING_MIN_WALLETS_LONG: "3"
+          ROLLING_TOP1_MAX_SHARE: "0.70"
+          ROLLING_TOP3_MAX_SHARE: "0.90"
+          ROLLING_SPOT_ONLY_SHARE: "0.80"
+          ROLLING_SUSPECT_CAP_SCORE: "6.5"
+
+          # 信号解释 / 回测 / 资金费率与流动性过滤 / 健康状态
+          SIGNAL_EXPLAIN_MODE: "1"
+          BACKTEST_MODE: "1"
+          SIGNAL_BACKTEST_WINDOW_DAYS: "30"
+          # 回测门槛胜率：普通胜率只看方向，门槛胜率要求达到最低收益幅度
+          # 信号生命周期：按提示从出现到消失/反转结算
+          SIGNAL_LIFECYCLE_MODE: "1"
+          STRONG_SIGNAL_MISSING_ROUNDS: "1"
+          LONGTERM_SIGNAL_MISSING_ROUNDS: "2"
+          STRONG_SIGNAL_MAX_HOLD_HOURS: "24"
+          LONGTERM_SIGNAL_MAX_HOLD_HOURS: "720"
+          # 主导钱包名单 + API异常保护
+          DOMINANT_WALLETS_MODE: "1"
+          DOMINANT_WALLET_TOP_N: "5"
+          DATA_ANOMALY_PROTECT_MODE: "1"
+
+          # GitHub 单文件 100MB 限制：先在脚本内裁剪，再由 hardcap 脚本二次兜底。
+          DB_PRUNE_MODE: "1"
+          DB_RAW_KEEP_RUNS: "12"
+          DB_HISTORY_KEEP_DAYS: "35"
+          DB_MAX_MB: "75"
+          DB_VACUUM_MODE: "auto"
+          DB_VACUUM_MIN_FREE_MB: "16"
+          DB_VACUUM_MIN_FREE_RATIO: "0.10"
+
+          # 压缩包硬上限：hl_monitor.db.gz 超过这个值就自动进入更激进清理，避免 push 被 GitHub 拒绝。
+          DB_GZ_MAX_MB: "85"
+          HARDCAP_RAW_KEEP: "12"
+          HARDCAP_HISTORY_DAYS: "35"
+          HARDCAP_FINAL_REPORTS_DAYS: "7"
+          LEGACY_BASELINE_MODE: "1"
+          BACKTEST_HURDLE_1H: "0.25"
+          BACKTEST_HURDLE_4H: "0.5"
+          BACKTEST_HURDLE_24H: "1"
+          BACKTEST_HURDLE_72H: "2"
+          BACKTEST_HURDLE_7D: "4"
+          BACKTEST_HURDLE_15D: "6"
+          BACKTEST_HURDLE_30D: "8"
+          RISK_FILTER_MODE: "1"
+          FUNDING_WARN_ABS_PCT: "0.03"
+          FUNDING_DANGER_ABS_PCT: "0.08"
+          LIQUIDITY_LOW_DAY_VOLUME: "20000000"
+          LIQUIDITY_MIN_DAY_VOLUME: "5000000"
+          HEALTH_STALE_HOURS: "2"
+
+          PYTHONUNBUFFERED: "1"
+          DETAILS_DIR: "reports/details"
+          DB_INSERT_CHUNK: "500"
+          RUN_STEP_LOG: "1"
+
+        run: |
+          python -u hl_monitor_final.py --rpm 300 --concurrency 10 --note "github half-hourly"
+
+      - name: Run guarded auto-analysis
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HL_DB_FILE: "hl_monitor.db"
+          THRESHOLD_FILE: "coin_thresholds.json"
+          AUTO_THRESHOLD_FILE: "coin_thresholds_auto.json"
+          REPORT_DIR: "reports"
+          DETAILS_DIR: "reports/details"
+          AUTO_OPTIMIZE_MODE: "guarded"
+          AUTO_OPTIMIZE_MIN_SAMPLES: "24"
+          AUTO_OPTIMIZE_VALIDATION_SAMPLES: "8"
+          AUTO_OPTIMIZE_STEP: "0.25"
+          AUTO_OPTIMIZE_MIN_GAIN: "0.10"
+          AUTO_OPTIMIZE_COOLDOWN_HOURS: "24"
+          AUTO_OPTIMIZE_POST_SAMPLES: "12"
+          AUTO_OPTIMIZE_MAX_CHANGES: "3"
+          AUTO_OPTIMIZE_REVIEW_TOP_N: "5"
+          AUTO_OPTIMIZE_MIN_WATCH_ENABLED: "1"
+          AUTO_OPTIMIZE_MIN_WATCH_MIN: "4"
+          AUTO_OPTIMIZE_MIN_WATCH_MAX: "8"
+          AUTO_OPTIMIZE_REQUIRE_DATA_QUALITY: "1"
+          DATA_QUALITY_MIN_SUCCESS_RATE: "0.85"
+          AUTO_OPTIMIZE_EVENT_GAP_HOURS: "24"
+          AUTO_OPTIMIZE_MAX_PENDING_DAYS: "30"
+          AUTO_OPTIMIZE_SAMPLE_RETENTION_DAYS: "180"
+          AUTO_OPTIMIZE_HISTORY_MAX_LINES: "2000"
+          GEMINI_OPTIMIZE_ENABLED: "1"
+          GEMINI_OPTIMIZE_REQUIRED: "1"
+          GEMINI_MODEL: "gemini-2.5-flash"
+          GEMINI_PROVIDER_ORDER: "developer,vertex"
+          GEMINI_VERTEX_ENABLED: "1"
+          GEMINI_VERTEX_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+          GEMINI_VERTEX_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+          GEMINI_VERTEX_MODEL: "gemini-2.5-flash"
+          GEMINI_RETRY_BACKOFF_SECONDS: "20,60,120"
+          GEMINI_FALLBACK_TO_VERTEX_ON_ANY_ERROR: "1"
+          GEMINI_MIN_CONFIDENCE: "0.70"
+          GEMINI_MAX_RETRIES: "3"
+          GEMINI_TIMEOUT_MS: "60000"
+          GEMINI_CIRCUIT_FAILURES: "6"
+          GEMINI_CIRCUIT_COOLDOWN_MINUTES: "30"
+          GEMINI_CIRCUIT_STATE_FILE: "reports/details/gemini_optimizer_circuit_state.json"
+          GEMINI_BUDGET_STATE_FILE: "reports/details/gemini_budget_state.json"
+          GEMINI_DAILY_MAX_CALLS: "160"
+          GEMINI_OPTIMIZER_MAX_CALLS_PER_DAY: "16"
+          GEMINI_SCAN_MAX_CALLS_PER_DAY: "140"
+        run: |
+          if [ -f analysis_layer.py ] && [ -f optimization_store.py ]; then
+            python -u analysis_layer.py
+          else
+            echo "::warning::Auto-analysis files missing; core monitor result is preserved."
+          fi
+
+      - name: Analyze completed scan with Gemini
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_OPTIMIZE_ENABLED: "1"
+          GEMINI_MODEL: "gemini-2.5-flash"
+          GEMINI_PROVIDER_ORDER: "developer,vertex"
+          GEMINI_VERTEX_ENABLED: "1"
+          GEMINI_VERTEX_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+          GEMINI_VERTEX_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+          GEMINI_VERTEX_MODEL: "gemini-2.5-flash"
+          GEMINI_RETRY_BACKOFF_SECONDS: "20,60,120"
+          GEMINI_FALLBACK_TO_VERTEX_ON_ANY_ERROR: "1"
+          GEMINI_MAX_RETRIES: "3"
+          GEMINI_TIMEOUT_MS: "60000"
+          GEMINI_CIRCUIT_FAILURES: "6"
+          GEMINI_CIRCUIT_COOLDOWN_MINUTES: "30"
+          GEMINI_CIRCUIT_STATE_FILE: "reports/details/gemini_scan_circuit_state.json"
+          GEMINI_SCAN_MAX_CHARS: "24000"
+          GEMINI_SCAN_MAX_OUTPUT_TOKENS: "4096"
+          # 每次扫描都分析：workflow 每30分钟跑一次，这里用 --force 跳过2小时冷却。
+          GEMINI_SCAN_INTERVAL_MINUTES: "30"
+          GEMINI_SCAN_CONTEXT_TOP_N: "20"
+          GEMINI_SCAN_HISTORY_RUNS: "4"
+          GEMINI_SCAN_STRONG_TRIGGER: "1"
+          GEMINI_SCAN_TG_ENABLED: "1"
+          GEMINI_SCAN_TG_MIN_URGENCY: "watch"
+          GEMINI_ERROR_TG_ENABLED: "1"
+          GEMINI_ERROR_TG_ONCE_PER_DAY: "1"
+          GEMINI_SCAN_REQUIRE_DATA_QUALITY: "1"
+          DATA_QUALITY_MIN_SUCCESS_RATE: "0.85"
+          GEMINI_BUDGET_STATE_FILE: "reports/details/gemini_budget_state.json"
+          GEMINI_DAILY_MAX_CALLS: "160"
+          GEMINI_OPTIMIZER_MAX_CALLS_PER_DAY: "16"
+          GEMINI_SCAN_MAX_CALLS_PER_DAY: "140"
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPORT_DIR: "reports"
+          DETAILS_DIR: "reports/details"
+        run: |
+          if [ -f gemini_scan_analysis.py ] && [ -f gemini_optimizer.py ]; then
+            python -u gemini_scan_analysis.py --force
+          else
+            echo "::warning::Gemini scan files missing; core monitor result is preserved."
+          fi
+
+
+      - name: Hard-cap local database before compression
+        if: always()
+        env:
+          HARDCAP_RAW_KEEP: "12"
+          HARDCAP_HISTORY_DAYS: "35"
+          HARDCAP_FINAL_REPORTS_DAYS: "7"
+          SIGNAL_EVENT_KEEP_DAYS: "90"
+          HARDCAP_VACUUM_MIN_FREE_MB: "16"
+          HARDCAP_VACUUM_MIN_FREE_RATIO: "0.10"
+        run: |
+          if [ -f hl_monitor.db ]; then
+            echo "Running hardcap compaction before gzip..."
+            python -u scripts/compact_sqlite_hardcap.py --db hl_monitor.db --raw-keep 12 --history-days 35 --final-reports-days 7
+            ls -lh hl_monitor.db || true
+          else
+            echo "No hl_monitor.db found; skip hardcap."
+          fi
+
+      - name: Compress local database with gzip hard cap
+        if: always()
+        env:
+          DB_GZ_MAX_MB: "85"
+        run: |
+          if [ ! -f hl_monitor.db ]; then
+            echo "No hl_monitor.db found; skip compression."
+            exit 0
+          fi
+
+          echo "Compressing hl_monitor.db to hl_monitor.db.gz..."
+          gzip -9 -c hl_monitor.db > hl_monitor.db.gz
+          ls -lh hl_monitor.db hl_monitor.db.gz || true
+
+          gz_mb=$(python -c "import os; p='hl_monitor.db.gz'; print(os.path.getsize(p)/1024/1024 if os.path.exists(p) else 0)")
+          echo "Compressed db size: ${gz_mb} MB; limit=${DB_GZ_MAX_MB} MB"
+
+          if python -c "import os,sys; size=os.path.getsize('hl_monitor.db.gz')/1024/1024 if os.path.exists('hl_monitor.db.gz') else 0; limit=float(os.getenv('DB_GZ_MAX_MB','85')); sys.exit(0 if size <= limit else 1)"; then
+            ok=0
+          else
+            ok=1
+          fi
+          if [ "$ok" != "0" ]; then
+            echo "hl_monitor.db.gz is still too large. Running emergency hardcap..."
+            python -u scripts/compact_sqlite_hardcap.py --db hl_monitor.db --raw-keep 2 --history-days 30 --final-reports-days 3 --hard
+            gzip -9 -c hl_monitor.db > hl_monitor.db.gz
+            ls -lh hl_monitor.db hl_monitor.db.gz || true
+          fi
+
+          python -c "import os,sys; size=os.path.getsize('hl_monitor.db.gz')/1024/1024 if os.path.exists('hl_monitor.db.gz') else 0; limit=float(os.getenv('DB_GZ_MAX_MB','85')); print(f'Final compressed db size: {size:.2f} MB / limit {limit:.2f} MB'); sys.exit(1 if size > limit else 0)"
+
+      - name: Clean report archives
+        run: |
+          mkdir -p reports/details
+          # reports/ 只能保存运行产物。清除误传的源码/配置，避免定时任务再次提交它们。
+          rm -f reports/*.py reports/*.pyc reports/*.md reports/*.yml reports/*.yaml
+          rm -f reports/requirements*.txt reports/.gitignore reports/.env reports/VERSION.txt
+          rm -f reports/coin_thresholds*.json reports/*_addresses.txt reports/*.db reports/*.db.gz
+          rm -rf reports/.github reports/scripts reports/tests reports/__pycache__
+          # 新版不再保留小时级 final_report_run_x.txt，历史遗留文件也删除
+          rm -f reports/final_report_run_*.txt
+          # 精简版：根目录只保留核心报告，旧版遗留的全量 CSV / 辅助报告从根目录清掉
+          rm -f             reports/wallet_states_latest.csv             reports/perp_positions_latest.csv             reports/spot_balances_latest.csv             reports/coin_signals_latest.csv             reports/active_changes_all_latest.csv             reports/fund_flow_lite_all_latest.csv             reports/wallet_quality_latest.csv             reports/wallet_quality_report.txt             reports/leverage_quality_latest.csv             reports/wallet_leverage_profile_latest.csv             reports/coin_leverage_summary_latest.csv             reports/leverage_quality_report.txt             reports/wallet_position_trades_latest.csv             reports/wallet_position_performance_latest.csv             reports/wallet_position_report.txt             reports/signal_explain_latest.csv             reports/coin_risk_latest.csv             reports/signal_backtest_latest.csv             reports/signal_backtest_latest_report.txt             reports/longterm_backtest_latest.csv             reports/longterm_backtest_latest_report.txt             reports/signal_lifecycle_latest.csv             reports/signal_lifecycle_report.txt             reports/long_term_candidates.csv             reports/watchlist_long.txt             reports/watchlist_short.txt             reports/watchlist_observe.txt
+          # 每日归档只保留最近 30 天
+          if [ -d reports/daily ]; then
+            find reports/daily -mindepth 1 -maxdepth 1 -type d | sort | head -n -30 | xargs -r rm -rf
+          fi
+
+      - name: Publish state to data branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -f hl_monitor.db || true
+          STAGE=$(mktemp -d)
+          [ -f hl_monitor.db.gz ] && cp -a hl_monitor.db.gz "$STAGE/"
+          [ -f coin_thresholds_auto.json ] && cp -a coin_thresholds_auto.json "$STAGE/"
+          if [ -d reports ]; then
+            cp -a reports "$STAGE/"
+          fi
+          cd "$STAGE"
+          git init
+          git checkout -b data
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No state files to publish."
+            exit 0
+          fi
+          git commit -m "monitor state $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin HEAD:data
+

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "signal_model_version": 2,
+  "overrides": {},
+  "meta": {},
+  "shadows": {},
+  "updated_at": "2026-09-09 13:25:34",
+  "mode": "guarded",
+  "review_top_n": 5
+}

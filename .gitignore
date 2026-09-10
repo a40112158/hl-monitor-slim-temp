@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+
+# Runtime state never belongs on main. It lives on the force-pushed `data` branch.
+hl_monitor.db
+hl_monitor.db.gz
+*.db
+*.db-wal
+*.db-shm
+reports/
