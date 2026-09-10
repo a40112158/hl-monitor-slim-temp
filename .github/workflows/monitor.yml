@@ -1,6 +1,8 @@
 name: Hyperliquid Wallet Monitor FINAL
 
 on:
+  schedule:
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       send_start_test:
